@@ -25,6 +25,7 @@ from jax import api_util
 from jax import lax
 from jax import tree_util
 from jax._src import ad_util
+from jax._src import checkify
 from jax._src import config
 from jax._src import core as jax_core
 from jax._src import effects
@@ -116,6 +117,22 @@ def _pad_values_to_block_dimension(value,
     value = jnp.pad(value, pad_width, constant_values=pad_value)
   return value
 
+def _initialize_scratch_vals(scratch_avals) -> tuple[jax.Array, ...]:
+  scratch_avals = (jax_core.raise_to_shaped(x) for x in scratch_avals)
+  return tuple(uninitialized_value(a.shape, a.dtype) for a in scratch_avals)
+
+def _initialize_output_vals(
+    out_shapes, input_args, input_output_aliases) -> Sequence[jax.Array]:
+  oi_map = {v: k for k, v in input_output_aliases}
+  output_vals = []
+  for i, out_shape in enumerate(out_shapes):
+    if i in oi_map:
+      output_vals.append(input_args[oi_map[i]])
+    else:
+      # TODO(sharadmv): use unitialized values for outputs
+      output_vals.append(jnp.zeros(out_shape.shape, out_shape.dtype))
+  return output_vals
+
 def _get_next_indices(grid, indices):
   next_indices = []
   carry = True
@@ -147,14 +164,7 @@ def _pallas_call_impl(*args, jaxpr, name, out_shapes, which_linear,
     discharged_jaxpr, consts = state_discharge.discharge_state(jaxpr, ())
     if debug:
       print(discharged_jaxpr)
-    oi_map = {v: k for k, v in input_output_aliases}
-    out = []
-    for i, out_shape in enumerate(out_shapes):
-      if i in oi_map:
-        out.append(args[oi_map[i]])
-      else:
-        # TODO(sharadmv): use unitialized values for outputs
-        out.append(jnp.zeros(out_shape.shape, out_shape.dtype))
+    out = _initialize_output_vals(out_shapes, args, input_output_aliases)
     scalars, args = split_list(args, [grid_mapping.num_index_operands])  # type: ignore
     # invars: [*scalar_prefetch, *inputs, *outputs, *scratch]
     num_invars = len(jaxpr.invars)
@@ -167,12 +177,7 @@ def _pallas_call_impl(*args, jaxpr, name, out_shapes, which_linear,
         jaxpr.invars, [grid_mapping.num_index_operands, num_inputs_outputs]
     )
     scratch_avals = [v.aval for v in scratch_invars]
-    if not all(
-        hasattr(a, "shape") and hasattr(a, "dtype") for a in scratch_avals
-    ):
-      raise NotImplementedError(f"Cannot initialize scratch: {scratch_avals}")
-    scratch_values = [uninitialized_value(a.shape, a.dtype)
-                      for a in scratch_avals]
+    scratch_values = _initialize_scratch_vals(scratch_avals)
 
     carry = []
     for x, bm in zip(itertools.chain(args, out), grid_mapping.block_mappings):
@@ -674,6 +679,164 @@ def _hoist_consts_to_refs(jaxpr: jax_core.Jaxpr) -> jax_core.Jaxpr:
   assert not consts, "All consts should have been converted to refs"
   return hoisted_jaxpr
 
+
+def checkify_pallas_kernel_body_jaxpr(
+    body_jaxpr: jax_core.ClosedJaxpr,
+    enabled_errors, error: checkify.Error) -> tuple[
+        jax_core.ClosedJaxpr, tree_util.PyTreeDef, set[checkify.ErrorEffect]]:
+  err_vals, err_tree = tree_util.tree_flatten(error)
+  err_vals = map(checkify.get_shaped_aval, err_vals)
+  flat_err_and_in_vals = [*err_vals, *body_jaxpr.in_avals]
+  checked_jaxpr, out_tree, error_effects = checkify.jaxpr_to_checkify_jaxpr(
+      body_jaxpr, enabled_errors, err_tree, *flat_err_and_in_vals)
+  return checked_jaxpr, out_tree, error_effects
+
+def pallas_call_checkify_rule(error: checkify.Error,
+                              enabled_errors,
+                              *args: jax_core.Value,
+                              jaxpr: jax_core.Jaxpr,
+                              interpret: bool,
+                              input_output_aliases: tuple[tuple[int, int], ...],
+                              grid_mapping: GridMapping,
+                              out_shapes,
+                              **kwargs):
+  # TODO(b/346651778): Support TPU/GPU checkify.
+  if not interpret:
+    raise NotImplementedError(
+        "Checkify for pallas_call only supports interpret mode.")
+  # We implement the checkify rule in 4 steps:
+  # 1) First, trace the kernel body to get the expected error shapes.
+  # 2) Checkify the kernel body to obtain a jaxpr with errors as inputs
+  #   and outputs.
+  # 3) Create a new kernel which stores the errors in output memrefs instead of
+  #   returning them, since pallas kernels do not return outputs.
+  # 4) Create block specs for the error state and call pallas_call with
+  #   the new kernel.
+  dynamic_grid_bounds, scalars, args = split_list(  # type: ignore
+      args, [grid_mapping.num_dynamic_grid_bounds, grid_mapping.num_index_operands]
+  )
+  num_scalars = len(scalars)
+  num_invars = len(jaxpr.invars)
+  num_inputs_outputs = (
+        num_invars
+        - grid_mapping.num_index_operands
+        - grid_mapping.num_scratch_operands
+    )
+  num_kernel_inputs = len(args)
+  num_scratch = num_invars - num_inputs_outputs
+  num_kernel_outputs = num_invars - num_scratch - num_kernel_inputs
+
+  # Trace the jaxpr to get an initial error value so the kernel jaxpr has all of
+  # the required inputs.
+  closed_jaxpr = pe.close_jaxpr(jaxpr)
+  _jaxpr, _, error_effects = checkify_pallas_kernel_body_jaxpr(
+      closed_jaxpr, enabled_errors, error)
+  error = error._add_placeholder_effects(error_effects)
+  err_vals, err_tree = jax.tree.flatten(error)
+  shaped_err_avals = tuple(map(checkify.get_shaped_aval, err_vals))
+
+  # Trace the kernel jaxpr to get a checkified jaxpr. This jaxpr will have
+  # all enabled errors removed, but have the error as inputs and return values.
+  input_avals = [v.aval for v in jaxpr.invars]
+  num_err_vals = len(err_vals)
+  shaped_input_avals = tuple(jax_core.raise_to_shaped(x) for x in input_avals)
+  checkify_in_avals = [*shaped_err_avals,
+                       *shaped_input_avals]
+  closed_kernel_jaxpr = pe.close_jaxpr(jaxpr)
+  checked_jaxpr, out_tree, _ = checkify.jaxpr_to_checkify_jaxpr(
+      closed_kernel_jaxpr, enabled_errors, err_tree, *checkify_in_avals)
+
+  # Create a new kernel to remove the error as an return value and instead
+  # write them to a memref. This is because pallas kernels are expected
+  # to have no return values but instead write their outputs to a ref.
+  def checked_kernel_fn(*args):
+    (scalars, in_error_refs, inputs, out_error_refs, outputs, scratch
+     ) = split_list(
+        args,
+        [num_scalars, num_err_vals,
+         num_kernel_inputs, num_err_vals, num_kernel_outputs])
+    input_error_vals = [err_ref[...] for err_ref in in_error_refs]
+    # We need to re-order the inputs here. A checkified jaxpr always expects
+    # errors as the first argument.
+    jaxpr_args = [*input_error_vals, *scalars, *inputs, *outputs, *scratch]
+    assert len(checked_jaxpr.jaxpr.invars) == len(jaxpr_args)
+    result_flat = jax.core.eval_jaxpr(
+        checked_jaxpr.jaxpr, checked_jaxpr.consts, *jaxpr_args)
+    output_errors, _ = split_list(result_flat, [num_err_vals])
+    # Store new errors back in the error refs.
+    for in_ref, out_ref, error in zip(
+        in_error_refs, out_error_refs, output_errors):
+      # We need to set both the input and output error refs.
+      # in_ref carries error state between grid iterations, but out_ref is the
+      # value that actually gets returned by the checked call.
+      in_ref[...] = error
+      out_ref[...] = error
+    return []
+
+  # Trace the new checked_kernel_fn with Memref inputs so that
+  # we can replace the old kernel jaxpr with the new checked jaxpr in
+  # pallas_call.
+  # TODO(justinfu): Place errors in scalar memory for non-interpret mode.
+  error_mem_space = None
+  error_memref_aval = [pallas_core.AbstractMemoryRef(
+      err_val, error_mem_space) for err_val in shaped_err_avals]
+  shaped_scalar_avals, input_aval, output_aval, scratch_aval = split_list(
+      shaped_input_avals, [num_scalars, num_kernel_inputs, num_kernel_outputs])
+  retrace_in_avals = [*shaped_scalar_avals, *error_memref_aval, *input_aval,
+                      *error_memref_aval, *output_aval, *scratch_aval]
+  jaxpr_flat_avals, jaxpr_in_tree = tree_util.tree_flatten(retrace_in_avals)
+  wrapped_kernel_with_err, out_tree_thunk = api_util.flatten_fun_nokwargs(
+      lu.wrap_init(checked_kernel_fn), jaxpr_in_tree)
+  debug = pe.debug_info(
+    checked_kernel_fn, jaxpr_in_tree, out_tree_thunk, False, "checkify_pallas")
+  final_jaxpr, _, _, () = pe.trace_to_jaxpr_dynamic(
+      wrapped_kernel_with_err, jaxpr_flat_avals, debug)
+
+  # Prepare pallas_call inputs. We need to create new block specs
+  # for the new error inputs and outputs.
+  scalar_avals = tuple(map(checkify.get_shaped_aval, scalars))
+  error_block_specs = [no_block_spec] * num_err_vals
+  grid_avals = [
+      jax_core.ShapedArray((), jnp.dtype("int32"))] * len(grid_mapping.grid)
+  # TODO(justinfu): Place these in device-specific scalar memory.
+  scalar_ref_avals = [
+      pallas_core.AbstractMemoryRef(
+          jax_core.ShapedArray(aval.shape, aval.dtype), None)
+      for aval in scalar_avals]
+  grid_tree = tree_util.tree_structure(((*grid_avals, *scalar_avals), {}))
+  error_block_mappings = tuple(map(
+        partial(
+            pallas_core._convert_block_spec_to_block_mapping,
+            (*grid_avals, *scalar_ref_avals),
+            in_tree=grid_tree), error_block_specs, error_memref_aval))
+  input_block_mappings, output_block_mappings = split_list(
+      grid_mapping.block_mappings, [num_kernel_inputs,])
+  grid_mapping_with_error = grid_mapping.replace(
+      block_mappings=(*error_block_mappings, *input_block_mappings,
+                      *error_block_mappings, *output_block_mappings)
+  )
+  error_out_shapes = tuple(
+      jax.ShapeDtypeStruct(e.shape, e.dtype) for e in shaped_err_avals)
+  # Bump all input_output_aliases by num_err_vals to make room for error
+  # TODO(justinfu): Don't bump scalars here.
+  input_output_aliases = tuple(
+      (i+num_err_vals, o+num_err_vals) for (i, o) in input_output_aliases)
+  input_output_aliases_with_error = tuple(
+      (i+num_scalars, i) for i in range(num_err_vals)) + input_output_aliases
+
+  new_vals_in = [*scalars, *err_vals, *args]
+  result = pallas_call_p.bind(*dynamic_grid_bounds, *new_vals_in,
+    jaxpr=final_jaxpr,
+    interpret=interpret,
+    grid_mapping=grid_mapping_with_error,
+    input_output_aliases=input_output_aliases_with_error,
+    out_shapes=error_out_shapes + out_shapes,
+    **kwargs)
+  errors, results = split_list(result, [num_err_vals])
+  new_error, _ = jax.tree.unflatten(out_tree, errors)
+  return new_error, results
+checkify.error_checks[pallas_call_p] = pallas_call_checkify_rule
+
 @weakref_lru_cache
 def _trace_to_jaxpr(fun: Callable, grid_spec: GridSpec, flat_in_avals,
                     flat_out_avals, in_tree, out_tree):
@@ -682,8 +845,10 @@ def _trace_to_jaxpr(fun: Callable, grid_spec: GridSpec, flat_in_avals,
   jaxpr_flat_avals, jaxpr_in_tree = tree_util.tree_flatten(avals)
   wrapped_fun, out_tree_thunk = api_util.flatten_fun_nokwargs(
       lu.wrap_init(fun), jaxpr_in_tree)
-  debug = pe.debug_info(fun, jaxpr_in_tree, out_tree_thunk, False, "pallas_call")
-  jaxpr, _, consts, () = pe.trace_to_jaxpr_dynamic(wrapped_fun, jaxpr_flat_avals, debug)
+  debug = pe.debug_info(
+      fun, jaxpr_in_tree, out_tree_thunk, False, "pallas_call")
+  jaxpr, _, consts, () = pe.trace_to_jaxpr_dynamic(
+      wrapped_fun, jaxpr_flat_avals, debug)
   jaxpr = _hoist_consts_to_refs(jaxpr)
   return grid_mapping, jaxpr, consts, out_tree_thunk()
 
@@ -720,48 +885,38 @@ def _pallas_call_lowering(
     impl = partial(_pallas_call_impl, **params, interpret=True)
     return mlir.lower_fun(impl, multiple_results=True)(ctx, *in_nodes)
 
-  def cpu_lowering(ctx: mlir.LoweringRuleContext,
-                   *in_nodes: mlir.ir.Value | Sequence[mlir.ir.Value],
-                   **params):
+  try:
+    [platform] = ctx.module_context.platforms
+  except ValueError:
+    raise ValueError(
+        "Can only lower pallas_call on a single platform."
+    ) from None
+
+  if platform == "cpu":
     raise ValueError("Only interpret mode is supported on CPU backend.")
-
-  def tpu_lowering(ctx: mlir.LoweringRuleContext,
-                   *in_nodes: mlir.ir.Value | Sequence[mlir.ir.Value],
-                   **params):
-    try:
-      from jax._src.pallas.mosaic import pallas_call_registration
-    except ImportError:
-      raise _unsupported_lowering_error("tpu")
-    else:
-      return pallas_call_registration.pallas_call_tpu_lowering_rule(
-          ctx, *in_nodes, **params
-      )
-
-  def gpu_lowering(ctx: mlir.LoweringRuleContext,
-                   *in_nodes: mlir.ir.Value | Sequence[mlir.ir.Value],
-                   **params):
+  elif platform == "cuda" or platform == "rocm":
     try:
       if _PALLAS_USE_MOSAIC_GPU.value:
         from jax._src.pallas.mosaic_gpu import pallas_call_registration
       else:
         from jax._src.pallas.triton import pallas_call_registration  # type: ignore
     except ImportError:
-      raise _unsupported_lowering_error("gpu")
+      pass
     else:
       return pallas_call_registration.pallas_call_lowering(
-          ctx, *in_nodes, **params
+          ctx, *in_nodes, interpret=interpret, **params
+      )
+  elif platform == "tpu":
+    try:
+      from jax._src.pallas.mosaic import pallas_call_registration  # type: ignore
+    except ImportError:
+      pass
+    else:
+      return pallas_call_registration.pallas_call_tpu_lowering_rule(
+          ctx, *in_nodes, interpret=interpret, **params
       )
 
-  return mlir.lower_per_platform(ctx, "pallas_call",
-                                 dict(cpu=cpu_lowering,
-                                      tpu=tpu_lowering,
-                                      cuda=gpu_lowering,
-                                      rocm=gpu_lowering),
-                                 None,  # default_rule
-                                 effects.no_effects,
-                                 *in_nodes,
-                                 interpret=interpret,
-                                 **params)
+  raise _unsupported_lowering_error(platform)
 
 
 mlir.register_lowering(pallas_call_p, _pallas_call_lowering)
