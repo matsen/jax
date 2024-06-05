@@ -232,6 +232,7 @@ def TPU_StridedStoreOp : TPU_Op<"strided_store"> {
   let hasVerifier = 1;
 }
 
+// TODO(jevinjiang): deprecate to use dynamic_rotate.
 def TPU_RotateOp : TPU_Op<"rotate", [Pure, SameOperandsAndResultType]> {
   let arguments = (ins
     AnyVector:$value,
@@ -245,6 +246,23 @@ def TPU_RotateOp : TPU_Op<"rotate", [Pure, SameOperandsAndResultType]> {
   let results = (outs AnyVector:$result);
   let assemblyFormat = [{
     $value `by` $amount `dim` $dimension (`stride` $stride `stride_dim` $stride_dimension^)? attr-dict `:` type($value)
+  }];
+  let hasVerifier = 1;
+}
+
+def TPU_DynamicRotateOp : TPU_Op<"dynamic_rotate", [Pure]> {
+  let arguments = (ins
+    AnyVector:$value,
+    I32:$amount,
+    SI32Attr:$dimension,
+    // When the stride is specified, the rotation amount for each index on the
+    // stride dimension will be (amount + stride * index).
+    OptionalAttr<SI32Attr>:$stride,
+    OptionalAttr<SI32Attr>:$stride_dimension
+  );
+  let results = (outs AnyVector:$result);
+  let assemblyFormat = [{
+    $value `by` $amount `dim` $dimension attr-dict `:` type($value) `,` type($amount)  `->` type($result)
   }];
   let hasVerifier = 1;
 }
@@ -603,6 +621,12 @@ def TPU_GetIterationBoundOp : TPU_Op<"iteration_bound"> {
   let arguments = (ins I32Attr:$dim);
   let results = (outs I32:$result);
   let assemblyFormat = [{ $dim attr-dict `:` type($result) }];
+}
+
+def TPU_GetInternalScratchOp : TPU_Op<"internal_scratch">  {
+  let arguments = (ins);
+  let results = (outs AnyMemRef:$result);
+  let assemblyFormat = [{ attr-dict `:` type($result) }];
 }
 
 def TPU_PRNGSeed32Op : TPU_Op<"prng_set_seed_32"> {
